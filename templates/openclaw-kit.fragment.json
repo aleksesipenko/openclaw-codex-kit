@@ -1,0 +1,48 @@
+{
+  "env": {
+    "CLIPROXYAPI_KEY": "__CLIPROXY_API_KEY__"
+  },
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "cliproxy-codex": {
+        "baseUrl": "__CLIPROXY_BASE_URL__",
+        "apiKey": "__CLIPROXY_API_KEY__",
+        "api": "openai-responses",
+        "authHeader": true,
+        "models": [
+          {
+            "id": "gpt-5.4",
+            "name": "gpt-5.4",
+            "reasoning": true,
+            "input": [
+              "text",
+              "image"
+            ],
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            },
+            "contextWindow": 1050000,
+            "maxTokens": 128000
+          }
+        ]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "cliproxy-codex/gpt-5.4"
+      },
+      "imageModel": {
+        "primary": "cliproxy-codex/gpt-5.4"
+      },
+      "models": {
+        "cliproxy-codex/gpt-5.4": {}
+      }
+    }
+  }
+}
