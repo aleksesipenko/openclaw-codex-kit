@@ -110,14 +110,17 @@ PY
   fi
 
   if [[ -n "$auth_json" ]]; then
-    CODEX_ACCOUNTS_DIR="$CODEX_ACCOUNTS_DIR" python3 - "$auth_json" <<'PY'
-import glob
+    CODEX_ACCOUNTS_DIR="$CODEX_ACCOUNTS_DIR" AUTH_DIR="$AUTH_DIR" CONTROL_CENTER_SCRIPT_DIR="$SCRIPT_DIR" python3 - "$auth_json" <<'PY'
 import json
 import math
 import os
 from pathlib import Path
 import sys
 from datetime import datetime, timezone
+
+sys.path.insert(0, os.environ["CONTROL_CENTER_SCRIPT_DIR"])
+
+from codex_quota_snapshot_lib import find_best_quota_file, load_json, read_identity_from_auth_data
 
 data = json.loads(sys.argv[1])
 files = data.get("files", [])
@@ -162,20 +165,28 @@ def render_quota(name, data):
     return info
 
 
-def find_quota_path(auth_name, email):
-    auth_stem = Path(auth_name or "").stem
-    quota_dir = Path(os.environ.get("CODEX_ACCOUNTS_DIR", str(Path.home() / ".codex" / "accounts")))
-    candidates = [
-        quota_dir / f".{auth_stem}.quota.json",
-        quota_dir / f".{email}.quota.json",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
+def quota_reason_text(reason):
+    mapping = {
+        "ambiguous_email_requires_exact_quota": "email использует несколько account_id; generic quota snapshot игнорируем",
+        "ambiguous_email_without_exact_quota": "для multi-identity email нет exact quota snapshot; нужен fresh probe",
+        "legacy_exact_quota_missing_account_id": "exact quota snapshot старого формата без account_id; нужен fresh probe",
+        "quota_snapshot_account_id_mismatch": "quota snapshot принадлежит другому account_id; игнорируем",
+        "quota_snapshot_email_mismatch": "quota snapshot принадлежит другому email; игнорируем",
+        "invalid_quota_json": "quota snapshot битый; игнорируем",
+        "quota_not_found": "quota snapshot не найден",
+        "missing_email": "у auth нет email для quota lookup",
+    }
+    return mapping.get(reason, reason.replace("_", " "))
 
-    pattern = str(quota_dir / f".{email}*.quota.json")
-    matches = sorted(glob.glob(pattern), key=lambda p: Path(p).stat().st_mtime, reverse=True)
-    return matches[0] if matches else None
+
+def find_quota_path(auth_name, email):
+    quota_dir = Path(os.environ.get("CODEX_ACCOUNTS_DIR", str(Path.home() / ".codex" / "accounts")))
+    auth_dir = Path(os.environ["AUTH_DIR"])
+    auth_path = auth_dir / Path(auth_name or "").name
+    auth_data = load_json(auth_path)
+    auth_email, account_id = read_identity_from_auth_data(auth_data)
+    resolved_email = auth_email or email
+    return find_best_quota_file(quota_dir, resolved_email, Path(auth_name or "").stem, account_id)
 
 
 def auth_freshness(auth_entry):
@@ -313,7 +324,9 @@ for i, f in enumerate(files, 1):
             extra = f"\n       \033[2m└ {msg}\033[0m"
 
     quota_info = ""
-    quota_path = find_quota_path(f.get("name", ""), email)
+    quota_path, quota_reason = find_quota_path(f.get("name", ""), email)
+    if quota_reason:
+        quota_info += f"\n      \033[2m└ {quota_reason_text(quota_reason)}\033[0m"
     if quota_path:
         try:
             if quota_snapshot_is_stale(quota_path, f, email):

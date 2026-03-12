@@ -2,34 +2,14 @@
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+from codex_quota_snapshot_lib import find_best_quota_file, load_json, read_identity_from_auth_data
+
 
 SYNC_KEY = "_quota_sync"
-
-
-def load_json(path: Path) -> dict | None:
-    try:
-        return json.loads(path.read_text())
-    except Exception:
-        return None
-
-
-def find_quota_file(quota_dir: Path, email: str, auth_stem: str) -> Path | None:
-    candidates = [
-        quota_dir / f".{auth_stem}.quota.json",
-        quota_dir / f".{email}.quota.json",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-
-    pattern = str(quota_dir / f".{email}*.quota.json")
-    matches = sorted(glob.glob(pattern), key=lambda p: Path(p).stat().st_mtime, reverse=True)
-    return Path(matches[0]) if matches else None
 
 
 def parse_auth_freshness(auth: dict, auth_path: Path) -> float:
@@ -78,13 +58,18 @@ def sync_auth_file(auth_path: Path, quota_dir: Path, now_ts: float) -> dict:
     if not isinstance(auth, dict):
         return {"file": auth_path.name, "status": "skipped", "reason": "invalid_auth_json"}
 
-    email = str(auth.get("email") or "").strip().lower()
+    email, account_id = read_identity_from_auth_data(auth)
     if not email:
         return {"file": auth_path.name, "status": "skipped", "reason": "missing_email"}
 
-    quota_path = find_quota_file(quota_dir, email, auth_path.stem)
+    quota_path, quota_reason = find_best_quota_file(quota_dir, email, auth_path.stem, account_id)
     if quota_path is None:
-        return {"file": auth_path.name, "email": email, "status": "skipped", "reason": "quota_not_found"}
+        return {
+            "file": auth_path.name,
+            "email": email,
+            "status": "skipped",
+            "reason": quota_reason or "quota_not_found",
+        }
 
     sync_meta = auth.get(SYNC_KEY)
     managed_before = isinstance(sync_meta, dict) and bool(sync_meta.get("managed_disabled"))

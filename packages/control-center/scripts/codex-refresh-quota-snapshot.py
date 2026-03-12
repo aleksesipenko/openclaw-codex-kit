@@ -2,91 +2,40 @@
 from __future__ import annotations
 
 import argparse
-import base64
-import json
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
+
+import json
+
+from codex_quota_snapshot_lib import (
+    build_quota_snapshot_payload,
+    matching_snapshot_stems,
+    read_identity_from_auth_data,
+)
 
 
 CODEX_DIR = Path.home() / ".codex"
 AUTH_FILE = CODEX_DIR / "auth.json"
 ACCOUNTS_DIR = CODEX_DIR / "accounts"
 SESSIONS_DIR = CODEX_DIR / "sessions"
-
-
-def decode_jwt_payload(token: str | None) -> dict:
-    if not isinstance(token, str) or token.count(".") < 2:
-        return {}
-    try:
-        payload_b64 = token.split(".")[1]
-        payload_b64 += "=" * (-len(payload_b64) % 4)
-        return json.loads(base64.urlsafe_b64decode(payload_b64.encode()).decode())
-    except Exception:
-        return {}
-
-
-def canonical_email(value: str | None) -> str | None:
-    if not isinstance(value, str):
-        return None
-    email = value.strip().lower()
-    return email if email and "@" in email else None
-
-
 def current_identity() -> tuple[str, str]:
-    data = json.loads(AUTH_FILE.read_text())
-    tokens = data.get("tokens") or {}
-    account_id = str(tokens.get("account_id") or "").strip()
-    if not account_id:
+    email, account_id = read_identity_from_auth_data(json.loads(AUTH_FILE.read_text()))
+    if not email or not account_id:
         raise SystemExit("current ~/.codex/auth.json has no account_id")
-
-    email = None
-    for token_name in ("id_token", "access_token"):
-        payload = decode_jwt_payload(tokens.get(token_name))
-        email = canonical_email(payload.get("email"))
-        if email:
-            break
-        profile = payload.get("https://api.openai.com/profile")
-        if isinstance(profile, dict):
-            email = canonical_email(profile.get("email"))
-            if email:
-                break
-    if not email:
-        raise SystemExit("could not determine email from current ~/.codex/auth.json")
     return email, account_id
 
 
-def matching_snapshot_stems(email: str, account_id: str) -> list[str]:
-    stems: list[str] = []
-    short_id = account_id.strip().lower().split("-", 1)[0][:8]
-    for path in sorted(ACCOUNTS_DIR.glob("*.json")):
-        if path.name.startswith("."):
-            continue
-        try:
-            data = json.loads(path.read_text())
-        except Exception:
-            continue
-        tokens = data.get("tokens") or {}
-        if str(tokens.get("account_id") or "").strip() != account_id:
-            continue
-        payload = decode_jwt_payload(tokens.get("id_token")) or decode_jwt_payload(tokens.get("access_token"))
-        candidate_email = canonical_email(payload.get("email"))
-        if not candidate_email:
-            profile = payload.get("https://api.openai.com/profile")
-            if isinstance(profile, dict):
-                candidate_email = canonical_email(profile.get("email"))
-        if candidate_email != email:
-            continue
-        stems.append(path.stem)
-    if f"{email}--{short_id}" not in stems:
-        stems.append(f"{email}--{short_id}")
-    if email not in stems:
-        stems.append(email)
-    return sorted(dict.fromkeys(stems))
+def session_contains_marker(session_path: Path, marker: str) -> bool:
+    try:
+        return marker in session_path.read_text(errors="ignore")
+    except Exception:
+        return False
 
 
-def newest_session_after(start_ts: float) -> Path | None:
+def newest_session_after(start_ts: float, marker: str) -> Path | None:
     candidates = []
     for path in SESSIONS_DIR.rglob("*.jsonl"):
         try:
@@ -94,7 +43,8 @@ def newest_session_after(start_ts: float) -> Path | None:
         except FileNotFoundError:
             continue
         if mtime >= start_ts - 1:
-            candidates.append((mtime, path))
+            if session_contains_marker(path, marker):
+                candidates.append((mtime, path))
     if not candidates:
         return None
     candidates.sort(key=lambda item: item[0], reverse=True)
@@ -119,16 +69,25 @@ def extract_rate_limits(session_path: Path) -> dict | None:
     return latest
 
 
-def write_quota_snapshots(stems: list[str], rate_limits: dict, session_path: Path) -> list[str]:
+def write_quota_snapshots(
+    stems: list[str],
+    rate_limits: dict,
+    session_path: Path,
+    *,
+    email: str,
+    account_id: str,
+    marker: str,
+) -> list[str]:
     written = []
-    payload = {
-        "rate_limits": rate_limits,
-        "_meta": {
-            "refreshed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "source_session": str(session_path),
-            "source": "codex_exec_probe",
-        },
-    }
+    payload = build_quota_snapshot_payload(
+        rate_limits=rate_limits,
+        session_path=session_path,
+        source="codex_exec_probe",
+        email=email,
+        account_id=account_id,
+        probe_marker=marker,
+    )
+    payload["_meta"]["refreshed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     for stem in stems:
         target = ACCOUNTS_DIR / f".{stem}.quota.json"
         target.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
@@ -136,10 +95,10 @@ def write_quota_snapshots(stems: list[str], rate_limits: dict, session_path: Pat
     return written
 
 
-def run_probe(prompt: str, timeout_seconds: float) -> tuple[int, str]:
+def run_probe(prompt: str, timeout_seconds: float, marker: str) -> tuple[int, str]:
     started = time.time()
     proc = subprocess.run(
-        ["codex", "exec", "--skip-git-repo-check", prompt],
+        ["codex", "exec", "--skip-git-repo-check", f"{prompt}\n\nquota-probe-marker: {marker}"],
         cwd=str(CODEX_DIR),
         capture_output=True,
         text=True,
@@ -158,16 +117,24 @@ def main() -> int:
     args = parser.parse_args()
 
     email, account_id = current_identity()
-    stems = matching_snapshot_stems(email, account_id)
+    stems = matching_snapshot_stems(ACCOUNTS_DIR, email, account_id)
     started = time.time()
-    returncode, output = run_probe(args.prompt, args.timeout)
-    session_path = newest_session_after(started)
+    marker = f"quota-probe::{uuid.uuid4().hex}"
+    returncode, output = run_probe(args.prompt, args.timeout, marker)
+    session_path = newest_session_after(started, marker)
     if session_path is None:
         raise SystemExit("probe finished but no fresh codex session file was found")
     rate_limits = extract_rate_limits(session_path)
     if not isinstance(rate_limits, dict):
         raise SystemExit(f"fresh session {session_path} had no token_count rate_limits payload")
-    written = write_quota_snapshots(stems, rate_limits, session_path)
+    written = write_quota_snapshots(
+        stems,
+        rate_limits,
+        session_path,
+        email=email,
+        account_id=account_id,
+        marker=marker,
+    )
 
     result = {
         "email": email,

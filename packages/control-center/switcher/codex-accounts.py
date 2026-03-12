@@ -9,6 +9,7 @@ import sys
 import shutil
 import base64
 import argparse
+import uuid
 from pathlib import Path
 
 CODEX_DIR = Path.home() / ".codex"
@@ -746,16 +747,19 @@ def _get_quota_cache_file(name):
     """Get path to quota cache file for an account."""
     return ACCOUNTS_DIR / f".{name}.quota.json"
 
-def _save_quota_cache(name, limits):
+def _save_quota_cache(name, limits, meta=None):
     """Save quota to cache file."""
     import time
     cache_file = _get_quota_cache_file(name)
     try:
+        payload = {
+            'rate_limits': limits,
+            'cached_at': time.time()
+        }
+        if isinstance(meta, dict) and meta:
+            payload['_meta'] = {key: value for key, value in meta.items() if value is not None}
         with open(cache_file, 'w') as f:
-            json.dump({
-                'rate_limits': limits,
-                'cached_at': time.time()
-            }, f)
+            json.dump(payload, f)
     except:
         pass
 
@@ -845,7 +849,12 @@ def _get_quota_for_account(name, source: Path):
     
     if not source.exists():
         return None
-    
+
+    probe_marker = f"quota-probe::{name}::{uuid.uuid4().hex}"
+    source_info = get_account_info(source) or {}
+    source_email = _canonical_email(source_info.get("email"))
+    source_account_id = source_info.get("account_id")
+
     # Switch to account
     shutil.copy(source, AUTH_FILE)
     
@@ -856,7 +865,7 @@ def _get_quota_for_account(name, source: Path):
     # Note: `-p` is *profile*, not prompt. Use `codex exec` like codex-quota.
     try:
         subprocess.run(
-            ["codex", "exec", "--skip-git-repo-check", "reply OK"],
+            ["codex", "exec", "--skip-git-repo-check", f"Reply with exactly OK.\n\nquota-probe-marker: {probe_marker}"],
             cwd=str(CODEX_DIR),
             capture_output=True,
             timeout=ping_timeout_seconds,
@@ -885,11 +894,17 @@ def _get_quota_for_account(name, source: Path):
         if not jsonl_files:
             continue
             
-        # Check each new session for rate_limits
+        # Check each new session for rate_limits and only trust the one
+        # that contains our unique probe marker.
         for session_file in sorted(jsonl_files, key=lambda f: f.stat().st_mtime, reverse=True):
             with open(session_file, 'r') as f:
-                lines = f.readlines()
-            
+                session_text = f.read()
+
+            if probe_marker not in session_text:
+                continue
+
+            lines = session_text.splitlines()
+
             for line in reversed(lines):
                 if not line.strip():
                     continue
@@ -898,7 +913,14 @@ def _get_quota_for_account(name, source: Path):
                     if (event.get('payload', {}).get('type') == 'token_count' and
                         event.get('payload', {}).get('rate_limits')):
                         limits = event['payload']['rate_limits']
-                        _save_quota_cache(name, limits)
+                        _save_quota_cache(name, limits, meta={
+                            'source': 'codex_accounts_quota_probe',
+                            'source_session': str(session_file),
+                            'source_account_snapshot': str(source),
+                            'identity_email': source_email,
+                            'account_id': source_account_id,
+                            'probe_marker': probe_marker,
+                        })
                         return limits
                 except json.JSONDecodeError:
                     continue
